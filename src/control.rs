@@ -1,12 +1,14 @@
 //! ACCP framing. All camera operations are synchronous: the firmware
 //! shares its ISP argument pool across commands, so no background feeder races it.
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Write},
+    fs::{File, OpenOptions, TryLockError},
+    hash::{BuildHasher, RandomState},
+    io::{ErrorKind, Write},
     net::{Ipv6Addr, SocketAddrV6, UdpSocket},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -37,33 +39,39 @@ pub fn hex(bytes: &[u8]) -> String {
 
 impl Camera {
     pub fn connect(mac: [u8; 6], index: u32, log: Option<&Path>) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("vrmagic-is3-{}.lock", hex(&mac)));
-        let lock = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)?,
-            Err(e) => return Err(e.into()),
+        // macOS gives each user its own temporary directory; a lock in /tmp
+        // also excludes an `is3` run with sudo.
+        let directory = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
         };
-        // SAFETY: valid open file; flock has no pointer arguments.
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "Camera already controlled by another local is3 process"
-        );
+        let path = directory.join(format!("vrmagic-is3-{}.lock", hex(&mac)));
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // Never follow a link planted in the shared directory.
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let lock = match options.clone().write(true).create_new(true).open(&path) {
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => options.open(&path),
+            lock => lock,
+        }
+        .with_context(|| format!("Open lock file {}", path.display()))?;
+        match lock.try_lock() {
+            Err(TryLockError::WouldBlock) => {
+                bail!("Camera already controlled by another local is3 process")
+            }
+            locked => locked?,
+        }
         let socket = UdpSocket::bind("[::]:0")?;
-        socket.connect(SocketAddrV6::new(address(mac), 50001, 0, index))?;
-        let mut seed = [0; 4];
-        File::open("/dev/urandom")?.read_exact(&mut seed)?;
+        socket
+            .connect(SocketAddrV6::new(address(mac), 50001, 0, index))
+            .context("The camera is controlled over IPv6; enable it on the interface")?;
         Ok(Self {
             socket,
-            identifier: u32::from_ne_bytes(seed),
+            // The camera answers a reused identifier with a stale reply, so
+            // each session starts at a random one.
+            identifier: RandomState::new().hash_one(Instant::now()) as u32,
             _lock: lock,
             log: log
                 .map(|p| OpenOptions::new().write(true).create_new(true).open(p))
@@ -102,9 +110,10 @@ impl Camera {
                     Err(e)
                         if matches!(
                             e.kind(),
-                            std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::ConnectionRefused
+                            ErrorKind::TimedOut
+                                | ErrorKind::WouldBlock
+                                | ErrorKind::ConnectionRefused
+                                | ErrorKind::ConnectionReset
                         ) =>
                     {
                         break;

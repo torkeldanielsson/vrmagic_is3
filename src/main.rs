@@ -1,18 +1,17 @@
 //! One process owns control, watchdog feeding and the optional RTP repair relay.
-#[cfg(not(target_os = "linux"))]
-compile_error!("Run is3 on a Linux host on the camera LAN; receivers may use any OS.");
-
+mod capture;
 mod control;
-mod linux;
 mod media;
+mod network;
 mod session;
 mod watchdog;
 
 use anyhow::{Context, Result, ensure};
+use capture::Capture;
 use clap::{Args, Parser, Subcommand};
 use control::Camera;
-use linux::{Capture, Interface};
 use media::{Codec, Frames};
+use network::Interface;
 use serde_json::json;
 use std::{
     fs::OpenOptions,
@@ -108,9 +107,9 @@ struct Stream {
 }
 
 fn parse_mac(value: &str) -> Result<[u8; 6], String> {
-    let parts: Vec<_> = value.split(':').collect();
+    let parts: Vec<_> = value.split([':', '-']).collect();
     if parts.len() != 6 || parts.iter().any(|p| p.len() != 2) {
-        return Err("Expected six colon-separated MAC octets".into());
+        return Err("Expected six MAC octets separated by colons or dashes".into());
     }
     let mut result = [0; 6];
     for (byte, text) in result.iter_mut().zip(parts) {
@@ -217,13 +216,21 @@ fn stream(
         !args.direct || !destination.is_loopback(),
         "Direct receiver must be on the camera LAN"
     );
+    // Where the camera sends video: the receiver itself, or this machine.
+    let video_destination = if args.direct {
+        destination
+    } else {
+        interface
+            .ipv4
+            .context("The relay needs an IPv4 address on the interface")?
+    };
     // Reserve the inbound port before configuring the camera. The raw capture
     // sees the full Ethernet frames, including bytes the normal UDP API loses.
     let receiver = if args.direct {
         None
     } else {
         Some(UdpSocket::bind((
-            interface.ipv4,
+            video_destination,
             args.receive_port.unwrap_or(0),
         ))?)
     };
@@ -235,14 +242,14 @@ fn stream(
     ensure!(
         args.direct
             || (receive_port != 50001
-                && (!(destination.is_loopback() || destination == interface.ipv4)
+                && (!(destination.is_loopback() || destination == video_destination)
                     || receive_port != args.port)),
         "Camera-to-relay port must differ from the local output/control port"
     );
-    let capture = if args.direct {
+    let mut capture = if args.direct {
         None
     } else {
-        Some(Capture::open(interface.index, args.run.target.camera)?)
+        Some(Capture::open(interface, args.run.target.camera)?)
     };
     let relay = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     if let Some(path) = &args.sdp {
@@ -264,11 +271,7 @@ fn stream(
         session::configure(
             camera,
             &profile,
-            if args.direct {
-                destination
-            } else {
-                interface.ipv4
-            },
+            video_destination,
             args.destination_mac.unwrap_or(interface.mac),
             receive_port,
         )?;
@@ -286,7 +289,6 @@ fn stream(
         let mut frames = Frames::new(args.codec);
         let mut packets = 0u64;
         let mut pictures = 0u64;
-        let mut buffer = [0; 65536];
         while running(stop, started, args.run.seconds) {
             let now = Instant::now();
             if now >= next_feed {
@@ -304,18 +306,14 @@ fn stream(
                 );
                 next_status = Instant::now() + Duration::from_secs(30);
             }
-            if let Some(capture) = &capture {
+            if let Some(capture) = &mut capture {
                 ensure!(
                     last_video.elapsed() < Duration::from_secs(15),
                     "No valid camera video for 15 seconds"
                 );
-                if let Some(n) = capture.receive(&mut buffer)?
-                    && let Some(packet) = media::extract(
-                        &buffer[..n],
-                        args.run.target.camera,
-                        receive_port,
-                        args.codec,
-                    )
+                if let Some(frame) = capture.receive()?
+                    && let Some(packet) =
+                        media::extract(frame, args.run.target.camera, receive_port, args.codec)
                 {
                     last_video = Instant::now();
                     for outgoing in frames.push(packet) {
@@ -364,7 +362,7 @@ fn run() -> Result<()> {
         Command::Keepalive(run) => &run.target,
         Command::Stream(stream) => &stream.run.target,
     };
-    let interface = linux::interface(&target.interface)?;
+    let interface = network::interface(&target.interface)?;
     let stop = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stop);
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;

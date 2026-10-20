@@ -25,14 +25,19 @@ story is in [docs/investigation.md](docs/investigation.md).
 
 ## Requirements
 
-- Linux on the machine that runs `is3`, with an Ethernet interface on the
-  same LAN as the camera. Only this machine needs the tool.
+- A Linux, macOS or Windows machine with an Ethernet interface on the same
+  LAN as the camera. Only this machine needs the tool.
 - A PoE switch or injector for the camera. The camera links at 100 Mbit.
 - A stable Rust toolchain from [rustup.rs](https://rustup.rs) to build.
 
-The H.264 relay captures raw Ethernet frames and therefore needs
-`CAP_NET_RAW` (run with `sudo`, or `setcap cap_net_raw+ep` on the binary).
-Status, keepalive and direct MJPEG need no privileges.
+Status, keepalive and direct MJPEG need no privileges. The H.264 relay
+captures raw Ethernet frames, which needs:
+
+- Linux: `CAP_NET_RAW`. Run it with `sudo`, or give the installed binary
+  the capability with `sudo setcap cap_net_raw+ep "$(command -v is3)"`
+  (again after each reinstall).
+- macOS: access to the BPF devices. Run it with `sudo`.
+- Windows: [Npcap](https://npcap.com), installed with its default options.
 
 ## Install
 
@@ -49,6 +54,10 @@ interface it is reachable on. The camera is addressed over IPv6 link-local,
 derived from the MAC, so no DHCP server or IP configuration is needed. The
 MAC is printed on the camera label, or visible in your switch.
 
+The interface name is the one your system shows: `eth0` or `enp3s0` from
+`ip link` on Linux, `en0` from `ifconfig` on macOS, and the adapter name
+from `Get-NetAdapter` on Windows, usually `Ethernet`.
+
 All MAC and IP addresses in this document are examples.
 
 ```sh
@@ -58,9 +67,9 @@ is3 status --camera 00:21:21:01:02:03 --interface eth0
 
 ### MJPEG, no relay
 
-The simplest and most robust path. The receiver must be on the same Ethernet
-segment as the camera, and you must give both its IPv4 address and its MAC
-(`ip -4 addr` and `ip link` on Linux):
+The simplest path. The receiver must be on the same Ethernet segment as the
+camera, and you must give both its IPv4 address and its MAC (`ip addr` on
+Linux, `ifconfig` on macOS, `ipconfig /all` on Windows):
 
 ```sh
 is3 stream --camera 00:21:21:01:02:03 --interface eth0 \
@@ -86,11 +95,17 @@ sudo "$(command -v is3)" stream \
   --to 192.0.2.20 --port 5004
 ```
 
-The camera streams to the controlling machine, the relay fixes the packets
-and forwards RTP/H.264 with payload type 96 to the receiver. The receiver can
-be anywhere IP routing allows, including `127.0.0.1` (the default for
-`--to`). Buffering one complete picture before forwarding adds about one
-frame of latency.
+On Windows, with Npcap installed:
+
+```powershell
+is3 stream --camera 00:21:21:01:02:03 --interface Ethernet --codec h264 --bit-depth 8 --to 192.0.2.20 --port 5004
+```
+
+The camera streams to the controlling machine's IPv4 address on that
+interface, the relay fixes the packets and forwards RTP/H.264 with payload
+type 96 to the receiver. The receiver can be anywhere IP routing allows,
+including `127.0.0.1` (the default for `--to`). Buffering one complete
+picture before forwarding adds about one frame of latency.
 
 `--bit-depth 10` selects High 10 Intra. The default profile is 1920×1080 at
 a requested 12 Mbit/s; `--width`, `--height` and `--bitrate-mbps` change it.

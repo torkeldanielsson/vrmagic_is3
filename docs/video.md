@@ -27,9 +27,9 @@ socket hands the application a payload missing its last two bytes. For the
 SPS that means a truncated `time_scale` field and a decoder error before the
 first picture; for slice fragments it means silently corrupt pictures.
 
-The relay captures the complete Ethernet frames with a raw socket, checks
-that the IPv4 and UDP declared ends agree, keeps the two extra bytes, and
-rebuilds the packets:
+The relay captures the complete Ethernet frames (a packet socket on Linux,
+libpcap on macOS, Npcap on Windows), checks that the IPv4 and UDP declared
+ends agree, keeps the two extra bytes, and rebuilds the packets:
 
 1. Validate the RTP header and the camera's payload type 26; rewrite it to 96.
 2. Group packets by SSRC and timestamp into pictures.
