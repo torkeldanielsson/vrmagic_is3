@@ -1,0 +1,6 @@
+/target/
+/artifacts/
+*.pcap
+*.pcapng
+*.jsonl
+*.mp4
